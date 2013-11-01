@@ -1,0 +1,106 @@
+-- at the moment, just a proof of concept
+
+module IRC.Client where
+
+import Control.Applicative
+import Control.Monad hiding (join)
+import Data.Char
+import Data.Function
+import Data.List
+import Data.Maybe
+import System.IO
+import Network
+
+import Control.Monad.Trans
+import Control.Monad.Trans.State
+
+import IRC.Types
+import IRC.Parser
+import IRC.Commands
+
+data RPS = Rock | Paper | Scissors deriving (Eq, Show)
+
+toRPS :: String -> RPS
+toRPS = toRPS' . map toLower where
+    toRPS' ('r':_) = Rock
+    toRPS' ('p':_) = Paper
+    toRPS' ('s':_) = Scissors
+
+winner :: RPS -> RPS -> Ordering
+winner Rock Paper = GT
+winner Paper Scissors = GT
+winner Scissors Rock = GT
+winner x y | x == y = EQ
+winner _ _ = LT
+
+type Mem = [(String,RPS)]
+
+checkWin :: Mem -> (Mem, Maybe String)
+checkWin [p1,p2] = ([], Just $ case (winner `on` snd) p1 p2 of
+    LT -> fst p1 ++ " wins"
+    EQ -> "tie"
+    GT -> fst p2 ++ " wins")
+checkWin m = (m, Nothing)
+
+-- a structure representing a collection of "responder" functions
+data Client = Client
+    { onMessage :: Handle -> Message -> StateT Mem IO ()
+    , onPrivMsg :: Handle -> PrivMsg -> StateT Mem IO ()
+    , onPing    :: Handle -> Ping    -> StateT Mem IO ()
+    , onWelcome :: Handle ->            StateT Mem IO ()
+    }
+
+type Target = String
+data PrivMsg = PrivMsg Nickname Target String
+data Ping = Ping String
+
+-- a simple function that takes a handle (i.e. connection to irc server) and
+-- parses output, splitting across specialized functions
+talk :: Handle -> Client -> StateT Mem IO ()
+talk h c = forever $ do
+    msg' <- (++ "\n") <$> liftIO (hGetLine h)
+    liftIO $ putStrLn . show $ msg'
+    let msg = parseMessage msg'
+    case fromJust msg of
+        Message (Just (User nick _ _)) "PRIVMSG" [chan,txt] -> onPrivMsg c h $ PrivMsg nick chan txt
+        Message src "PING" [origin] -> onPing c h $ Ping origin
+        Message _ "001" _ -> onWelcome c h
+        _ -> onMessage c h (fromJust msg)
+
+defClient = Client
+    { onMessage = \_ _ -> return ()
+    , onPing = \h (Ping origin) -> do
+        liftIO . hPutStrLn h . send $ pong origin
+        liftIO . putStrLn . send $ pong origin
+    , onPrivMsg = defOnPrivMsg
+    , onWelcome = \h -> liftIO . hPutStrLn h . send $ join ["#words"]
+    }
+
+defOnPrivMsg h (PrivMsg nick me txt) = do
+    case txt of
+        _ | "quit" `isPrefixOf` txt -> liftIO . hPutStrLn h . send $
+            quit . Just . unwords . tail . words $ txt
+          | "echo" `isPrefixOf` txt -> liftIO . hPutStrLn h . send $
+            privmsg (case head me of
+                '#' -> me
+                _   -> nick) (unwords . tail . words $ txt)
+          | "rps" `isPrefixOf` txt -> do
+            let play = unwords . tail . words $ txt
+            modify ((nick, toRPS play) :)
+            (newmem,out) <- checkWin <$> get
+            put newmem
+            liftIO . hPutStrLn h . send . privmsg (case head me of
+                    '#' -> me
+                    _   -> nick) $ "ok"
+            case out of
+                Nothing -> return ()
+                Just out -> liftIO . hPutStrLn h . send . privmsg "#words" $ out
+          | otherwise -> return ()
+
+ircmain = do
+    h <- connectTo "irc.foonetic.net" (PortNumber 6667)
+    hSetBuffering h LineBuffering
+
+    hPutStrLn h . send $ user "testbot" "testbot"
+    hPutStrLn h . send $ nick "testbot"
+    runStateT (talk h defClient) []
